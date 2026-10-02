@@ -24,3 +24,6 @@ python/models/
 # Sistema
 .DS_Store
 Thumbs.db
+
+# Documentación pública
+!docs/*.pdf
