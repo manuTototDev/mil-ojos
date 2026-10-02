@@ -1,0 +1,26 @@
+# Datos de personas: nunca se versionan en este repo
+*.pkl
+*.npy
+*.csv
+*.jpg
+*.jpeg
+*.png
+*.webp
+*.pdf
+capturas/
+fcaesDes/
+rnpdno_data/
+*.log
+*_log*.txt
+*_output*.txt
+
+# Python
+__pycache__/
+*.py[cod]
+venv/
+.env
+python/models/
+
+# Sistema
+.DS_Store
+Thumbs.db
