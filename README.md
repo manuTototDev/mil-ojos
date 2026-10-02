@@ -37,6 +37,12 @@ Proyecto desarrollado con el apoyo de **Jóvenes Creadores 2025-2026** (Sistema 
 | `arduino/arduino.ino` | Firmware v3 (16 canales, una placa) |
 | `config/` | Calibración de cada brazo y mapeo cámara↔brazo de la última sesión |
 | `rnpdno/` | Scripts para consultar registros públicos y generar la base local |
+| `web/frontend/` | Interfaz web de visualización ([milojos.totot.mx](https://milojos.totot.mx)): escaneo con la cámara del visitante, explorador de fichas y detalle. Next.js 15 / React 19 en Vercel |
+| `web/backend/` | API de búsqueda (FastAPI + InsightFace) para la interfaz web. La base de rostros se descarga al arrancar y no está en este repo |
+
+## Interfaz web
+
+**[milojos.totot.mx](https://milojos.totot.mx)** es la extensión digital de la pieza: cualquier persona puede usar la cámara de su dispositivo para buscar parecidos en los boletines públicos de búsqueda, con lo que cada pantalla se vuelve un ojo más.
 
 ## Uso
 

@@ -1,0 +1,368 @@
+import os
+import io
+import pickle
+import numpy as np
+from fastapi import FastAPI, File, UploadFile, HTTPException
+from fastapi.middleware.cors import CORSMiddleware
+from fastapi.staticfiles import StaticFiles
+from fastapi.responses import JSONResponse, Response
+from PIL import Image
+import zipfile
+import cv2
+import httpx
+from insightface.app import FaceAnalysis
+
+# ── Caché de imágenes en memoria ──────────────────────────────────────────────
+# Clave: filename (ej. "2024_foto_NAME.jpg"), Valor: bytes
+_img_cache: dict[str, bytes] = {}
+
+# ── Rutas ─────────────────────────────────────────────────────────────────────
+BASE_DIR   = os.path.dirname(os.path.abspath(__file__))
+DATA_DIR   = os.environ.get("DATA_DIR", BASE_DIR)
+DB_FILE    = os.path.join(DATA_DIR, "face_database.pkl") if os.path.exists(os.path.join(os.environ.get("DATA_DIR", ""), "face_database.pkl")) else os.path.join(BASE_DIR, "face_database.pkl")
+STATIC_DIR = os.path.join(DATA_DIR, "static") if os.path.isdir(os.path.join(os.environ.get("DATA_DIR", ""), "static")) else os.path.join(BASE_DIR, "static")
+
+# ── Extracción de ZIPs ────────────────────────────────────────────────────────
+def setup_static_from_zips():
+    import zipfile
+    from huggingface_hub import hf_hub_download
+    os.makedirs(STATIC_DIR, exist_ok=True)
+    fotos_dir = os.path.join(STATIC_DIR, "fotos_recortadas")
+    boletines_dir = os.path.join(STATIC_DIR, "boletines_webp")
+    
+    SPACE_ID = "manuTototDev/mil-ojos-api"
+    
+    if not os.path.isdir(fotos_dir):
+        print("Descargando fotos.zip...")
+        local_fotos_zip = hf_hub_download(repo_id=SPACE_ID, filename="fotos.zip", repo_type="space")
+        print(f"Descomprimiendo fotos...")
+        with zipfile.ZipFile(local_fotos_zip, 'r') as zip_ref:
+            zip_ref.extractall(fotos_dir)
+            
+    if not os.path.isdir(boletines_dir):
+        print("Descargando boletines.zip...")
+        local_bols_zip = hf_hub_download(repo_id=SPACE_ID, filename="boletines.zip", repo_type="space")
+        print(f"Descomprimiendo boletines...")
+        with zipfile.ZipFile(local_bols_zip, 'r') as zip_ref:
+            zip_ref.extractall(boletines_dir)
+
+# Ejecutar antes de evaluar USE_LOCAL_STATIC
+setup_static_from_zips()
+STATIC_DIR = os.path.join(DATA_DIR, "static") if os.path.isdir(os.path.join(os.environ.get("DATA_DIR", ""), "static")) else os.path.join(BASE_DIR, "static")
+
+# CDN base URL for images (served from HF Dataset — no file limit)
+HF_CDN_BASE = "https://huggingface.co/datasets/manuTototDev/mil-ojos-images/resolve/main"
+USE_LOCAL_STATIC = os.path.isdir(STATIC_DIR) and len(os.listdir(os.path.join(STATIC_DIR, "fotos_recortadas", ""))) > 10 if os.path.isdir(os.path.join(STATIC_DIR, "fotos_recortadas")) else False
+
+# ── FastAPI ───────────────────────────────────────────────────────────────────
+app = FastAPI(title="Mil Ojos API", version="1.0")
+
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
+
+# ── Cargar DB de embeddings al arrancar ───────────────────────────────────────
+print("Cargando base de datos de rostros...")
+with open(DB_FILE, "rb") as f:
+    raw_db = pickle.load(f)
+
+# Construir índice limpio
+database   = []
+db_embeddings = []
+
+for i, entry in enumerate(raw_db):
+    raw_name = entry["name"]          # ej. "NOMBRE APELLIDO APELLIDO.jpg"
+    name     = os.path.splitext(raw_name)[0]   # quitar .jpg
+    year     = str(entry["year"])
+
+    # Boletin: use WebP version (much smaller), foto: keep JPG (already tiny)
+    bol_base = os.path.splitext(raw_name)[0] + ".webp"
+
+    # URLs: local /static/ when images on disk, proxy otherwise
+    if USE_LOCAL_STATIC:
+        foto_url = f"/static/fotos_recortadas/{year}_foto_{raw_name}"
+        bol_url  = f"/static/boletines_webp/{year}_{bol_base}"
+    else:
+        foto_url = f"/img/fotos_recortadas/{year}_foto_{raw_name}"
+        bol_url  = f"/img/boletines_webp/{year}_{bol_base}"
+
+    database.append({
+        "id":      i,
+        "name":    name,
+        "year":    year,
+        "foto":    foto_url,
+        "boletin": bol_url,
+    })
+    db_embeddings.append(entry["embedding"])
+
+db_matrix = np.array(db_embeddings, dtype=np.float32)
+print(f"Base de datos lista: {len(database)} personas.")
+
+# ── Marcar entradas con imagen disponible ─────────────────────────────────────
+if USE_LOCAL_STATIC:
+    # Local: check disk
+    fotos_dir = os.path.join(STATIC_DIR, "fotos_recortadas")
+    available_fotos = set(os.listdir(fotos_dir)) if os.path.isdir(fotos_dir) else set()
+    # CDN: Se omite la consulta de miles de archivos a HF por lentitud.
+    # Asumimos que todas las fotos están disponibles (sobre demanda).
+    available_fotos = None
+
+count_available = 0
+for entry in database:
+    year = entry["year"]
+    # Reconstruct filename to check
+    foto_filename = entry["foto"].split("/")[-1]  # e.g. 2024_foto_NAME.jpg
+    if available_fotos is None:
+        entry["has_foto"] = True
+    else:
+        entry["has_foto"] = foto_filename in available_fotos
+    if entry["has_foto"]:
+        count_available += 1
+
+print(f"Personas con foto disponible: {count_available}/{len(database)}")
+
+# ── InsightFace ───────────────────────────────────────────────────────────────
+print("Cargando modelo InsightFace...")
+face_app = FaceAnalysis(name="buffalo_l", providers=["CPUExecutionProvider"])
+face_app.prepare(ctx_id=0, det_size=(640, 640))
+print("Modelo listo.")
+
+# ── Caché de face bboxes para las fotos de la DB ─────────────────────────────
+# Se llena lazy: cada foto se detecta una sola vez y se guarda el bbox
+face_bbox_cache: dict[int, dict | None] = {}
+
+def detect_face_in_photo(entry_id: int) -> dict | None:
+    """Detecta el rostro en la foto de una persona y retorna bbox + lm106 normalizados."""
+    if entry_id in face_bbox_cache:
+        return face_bbox_cache[entry_id]
+
+    # If images aren't on disk, return a default centered bbox (no landmarks)
+    if not USE_LOCAL_STATIC:
+        face_bbox_cache[entry_id] = {"x": 0.1, "y": 0.05, "w": 0.8, "h": 0.85, "lm106": []}
+        return face_bbox_cache[entry_id]
+
+    entry = database[entry_id]
+    foto_rel = entry["foto"]  # e.g. /static/fotos_recortadas/2024_foto_NAME.jpg
+    foto_path = os.path.join(BASE_DIR, foto_rel.lstrip("/"))
+
+    if not os.path.exists(foto_path):
+        face_bbox_cache[entry_id] = None
+        return None
+
+    try:
+        img = cv2.imread(foto_path)
+        if img is None:
+            face_bbox_cache[entry_id] = None
+            return None
+
+        h, w = img.shape[:2]
+        faces = face_app.get(img)
+        if not faces:
+            face_bbox_cache[entry_id] = {"x": 0.1, "y": 0.05, "w": 0.8, "h": 0.85, "lm106": []}
+            return face_bbox_cache[entry_id]
+
+        face = max(faces, key=lambda f: (f.bbox[2]-f.bbox[0]) * (f.bbox[3]-f.bbox[1]))
+        bbox = face.bbox.astype(float)
+
+        # Extract 106 landmarks if available
+        lm106 = []
+        if hasattr(face, 'landmark_2d_106') and face.landmark_2d_106 is not None:
+            for pt in face.landmark_2d_106:
+                lm106.append({"x": float(pt[0] / w), "y": float(pt[1] / h)})
+
+        result = {
+            "x": float(max(0, bbox[0]) / w),
+            "y": float(max(0, bbox[1]) / h),
+            "w": float(min(bbox[2] - bbox[0], w) / w),
+            "h": float(min(bbox[3] - bbox[1], h) / h),
+            "lm106": lm106,
+        }
+        face_bbox_cache[entry_id] = result
+        return result
+    except Exception:
+        face_bbox_cache[entry_id] = None
+        return None
+
+# ── Imágenes estáticas (solo si están en disco) ──────────────────────────────
+if USE_LOCAL_STATIC:
+    app.mount("/static", StaticFiles(directory=STATIC_DIR), name="static")
+    print(f"Sirviendo imágenes locales desde {STATIC_DIR}")
+else:
+    print(f"Imágenes servidas vía proxy caché desde {HF_CDN_BASE}")
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# PROXY DE IMÁGENES — cachea en RAM, evita latencia HF→Navegador
+# ══════════════════════════════════════════════════════════════════════════════
+@app.get("/img/{folder}/{filename}")
+async def img_proxy(folder: str, filename: str):
+    """Proxy con caché en memoria para imágenes del dataset HF."""
+    # Solo permitir carpetas conocidas
+    if folder not in ("fotos_recortadas", "boletines_webp"):
+        raise HTTPException(404, "Carpeta desconocida")
+
+    cache_key = f"{folder}/{filename}"
+
+    if cache_key in _img_cache:
+        data = _img_cache[cache_key]
+    else:
+        cdn_url = f"{HF_CDN_BASE}/{folder}/{filename}"
+        try:
+            async with httpx.AsyncClient(timeout=15.0) as client:
+                r = await client.get(cdn_url)
+            if r.status_code != 200:
+                raise HTTPException(r.status_code, "Imagen no encontrada en CDN")
+            data = r.content
+            # Solo cachear fotos (pequeñas). Boletines son pesados, no los acumulamos.
+            if folder == "fotos_recortadas":
+                _img_cache[cache_key] = data
+        except httpx.TimeoutException:
+            raise HTTPException(504, "Timeout al obtener imagen")
+
+    # Detectar content-type por extensión
+    ext = filename.rsplit(".", 1)[-1].lower()
+    ctype = {"jpg": "image/jpeg", "jpeg": "image/jpeg",
+             "webp": "image/webp", "png": "image/png"}.get(ext, "image/jpeg")
+
+    return Response(
+        content=data,
+        media_type=ctype,
+        headers={
+            # Navegador cachea 7 días, CDN intermedio 1 día
+            "Cache-Control": "public, max-age=604800, s-maxage=86400",
+        }
+    )
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# ENDPOINTS
+# ═══════════════════════════════════════════════════════════════════════════════
+
+@app.get("/")
+def health():
+    import traceback
+    debug_info = {
+        "BASE_DIR": BASE_DIR,
+        "DATA_DIR": DATA_DIR,
+        "STATIC_DIR": STATIC_DIR,
+        "base_exists": os.path.exists(BASE_DIR),
+        "fotos_zip_exists": os.path.exists(os.path.join(BASE_DIR, "fotos.zip")),
+        "base_files": os.listdir(BASE_DIR)[:5],
+        "use_local_static": USE_LOCAL_STATIC
+    }
+    
+    fotos_dir = os.path.join(STATIC_DIR, "fotos_recortadas")
+    debug_info["fotos_dir_exists"] = os.path.isdir(fotos_dir)
+    if os.path.isdir(fotos_dir):
+        debug_info["fotos_count"] = len(os.listdir(fotos_dir))
+    
+    available = sum(1 for e in database if e.get("has_foto"))
+    return {"status": "ok", "personas": len(database), "con_foto": available, "debug_info": debug_info}
+
+
+@app.post("/search")
+async def search_face(file: UploadFile = File(...)):
+    """
+    Recibe una imagen (selfie), detecta el rostro,
+    y devuelve las 12 personas más parecidas de la DB.
+    """
+    contents = await file.read()
+    nparr    = np.frombuffer(contents, np.uint8)
+    img_cv   = cv2.imdecode(nparr, cv2.IMREAD_COLOR)
+
+    if img_cv is None:
+        raise HTTPException(400, "No se pudo decodificar la imagen")
+
+    faces = face_app.get(img_cv)
+    if not faces:
+        raise HTTPException(422, "No se detectó ningún rostro en la imagen")
+
+    # El rostro principal = el más grande
+    main_face = max(faces, key=lambda f: (f.bbox[2]-f.bbox[0]) * (f.bbox[3]-f.bbox[1]))
+    query_emb = main_face.normed_embedding.astype(np.float32)
+
+    # Similitud coseno (embeddings ya normalizados)
+    similarities = np.dot(db_matrix, query_emb)
+    # Get more candidates than needed, then filter by available images
+    top_idx = np.argsort(similarities)[-30:][::-1]
+
+    results = []
+    for idx in top_idx:
+        if len(results) >= 8:
+            break
+        entry = database[idx]
+        if not entry.get("has_foto", True):
+            continue  # Skip entries without uploaded images
+        result = entry.copy()
+        result["score"] = float(round(similarities[idx] * 100, 1))
+        result["match_face_box"] = detect_face_in_photo(idx)
+        results.append(result)
+
+    # Atributos del visitante
+    gender = "femenino" if main_face.sex == 0 else "masculino"
+    age    = int(main_face.age)
+
+    # BBox normalizado (0-1)
+    h, w = img_cv.shape[:2]
+    bbox = main_face.bbox.astype(float)
+    face_box = {
+        "x":  float(bbox[0] / w),
+        "y":  float(bbox[1] / h),
+        "w":  float((bbox[2] - bbox[0]) / w),
+        "h":  float((bbox[3] - bbox[1]) / h),
+    }
+
+    # 106 landmarks normalizados (0-1) del modelo 2d106det incluido en buffalo_l
+    lm106 = []
+    if hasattr(main_face, 'landmark_2d_106') and main_face.landmark_2d_106 is not None:
+        for pt in main_face.landmark_2d_106:
+            lm106.append({"x": float(pt[0] / w), "y": float(pt[1] / h)})
+
+    return JSONResponse({
+        "visitor":  {"gender": gender, "age": age},
+        "face_box": face_box,
+        "lm106":    lm106,
+        "results":  results
+    })
+
+
+@app.get("/fichas")
+def list_fichas(page: int = 1, limit: int = 48, year: str = None, q: str = None):
+    """Lista paginada de todas las fichas, con filtro opcional por año y nombre."""
+    filtered = database
+
+    if year:
+        filtered = [p for p in filtered if p["year"] == year]
+
+    if q:
+        q_lower = q.lower()
+        filtered = [p for p in filtered if q_lower in p["name"].lower()]
+
+    total = len(filtered)
+    start = (page - 1) * limit
+    end   = start + limit
+    items = filtered[start:end]
+
+    return {
+        "total": total,
+        "page":  page,
+        "pages": (total + limit - 1) // limit,
+        "items": items,
+    }
+
+
+@app.get("/fichas/{ficha_id}")
+def get_ficha(ficha_id: int):
+    """Retorna los datos de una ficha por su ID numérico."""
+    if ficha_id < 0 or ficha_id >= len(database):
+        raise HTTPException(404, "Ficha no encontrada")
+    return database[ficha_id]
+
+
+@app.get("/years")
+def get_years():
+    """Retorna los años disponibles en la base de datos."""
+    years = sorted(set(p["year"] for p in database))
+    return {"years": years}
