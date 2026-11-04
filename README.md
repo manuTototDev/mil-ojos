@@ -59,3 +59,11 @@ python python/sistema.py --sin-arduino               # solo visión
 ## Especificación honesta
 
 La similitud máxima observada entre un rostro en vivo y la base ronda el 30-36 %. El sistema no confirma identidades: muestra parecidos.
+
+## Licencia
+
+El código y el firmware de Mil Ojos son software libre, publicados bajo la [GNU General Public License v3.0](LICENSE). Puedes usarlos, estudiarlos, modificarlos y redistribuirlos, siempre que las versiones derivadas se publiquen con la misma licencia.
+
+Copyright © 2026 Manuel Mendoza.
+
+Las dependencias conservan sus propias licencias. Los modelos preentrenados de InsightFace (`buffalo_l`) se descargan aparte y su licencia es solo para investigación no comercial.
